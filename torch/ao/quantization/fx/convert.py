@@ -74,7 +74,7 @@ from .lower_to_fbgemm import lower_to_fbgemm
 # importing the lib so that the quantized_decomposed ops are registered
 from ._decomposed import quantized_decomposed_lib  # noqa: F401
 from torch.ao.quantization.observer import _is_activation_post_process
-
+import operator
 
 # TODO: revisit this list. Many helper methods shouldn't be public
 __all__ = [
@@ -132,6 +132,7 @@ def _replace_observer_with_quantize_dequantize_node(
     if hasattr(activation_post_process, "compute_dtype"):
         compute_dtype = activation_post_process.compute_dtype  # type: ignore[attr-defined]
     quantize_op : Optional[Union[Callable, str]] = None
+    is_dynamic = False
     if dtype in [torch.quint8, torch.qint8, torch.qint32] and \
             not hasattr(activation_post_process, 'compute_dtype'):
         node_type = "call_function"
@@ -149,13 +150,13 @@ def _replace_observer_with_quantize_dequantize_node(
             if is_decomposed:
                 quant_min = activation_post_process.quant_min  # type: ignore[attr-defined]
                 quant_max = activation_post_process.quant_max  # type: ignore[attr-defined]
-                dtype = to_underlying_dtype(dtype)
+                dtype_ = to_underlying_dtype(dtype)
                 qparams = {
                     "_scale_": scale,
                     "_zero_point_": zero_point,
-                    "_quant_min": quant_min,
-                    "_quant_max": quant_max,
-                    "_dtype_": dtype
+                    "_quant_min_": quant_min,
+                    "_quant_max_": quant_max,
+                    "_dtype_": dtype_
                 }
                 quantize_op = torch.ops.quantized_decomposed.quantize_per_tensor
             else:
@@ -165,41 +166,117 @@ def _replace_observer_with_quantize_dequantize_node(
         # TODO(future PR): switch compute_dtype to is_dynamic
         # dynamic quantization
         node_type = "call_function"
+        is_dynamic = True
         if is_decomposed:
-            raise NotImplementedError("decomposed quantize_per_tensor_dynamic op not implemented yet")
+            dtype_ = to_underlying_dtype(dtype)
+            assert dtype_ in [torch.uint8, torch.int8], \
+                "only uint8 and int8 are supported in reference flow for " \
+                "dynamic quantization right now"
+            quant_min = activation_post_process.quant_min  # type: ignore[attr-defined]
+            quant_max = activation_post_process.quant_max  # type: ignore[attr-defined]
+            # note: scale and zero_point are missing for quantize_per_tensor op
+            # we'll need to get this from choose_qparams op, which we'll add after
+            # this stage
+            qparams = {
+                "_quant_min_": quant_min,
+                "_quant_max_": quant_max,
+                "_dtype_": dtype_
+            }
+            quantize_op = torch.ops.quantized_decomposed.quantize_per_tensor.tensor
         else:
             quantize_op = torch.quantize_per_tensor_dynamic
-        # TODO: get reduce range from observer
-        # reduce_range = activation_post_process.reduce_range
-        reduce_range = torch.backends.quantized.engine in ("fbgemm", "x86")
-        qparams = {"_dtype_": compute_dtype, "_reduce_range_": reduce_range}
+            # TODO: get reduce range from observer
+            # reduce_range = activation_post_process.reduce_range
+            reduce_range = torch.backends.quantized.engine in ("fbgemm", "x86")
+            qparams = {"_dtype_": compute_dtype, "_reduce_range_": reduce_range}
     elif dtype == torch.float16:
         node_type = "call_method"
         quantize_op = "to"
         qparams = {"_dtype_": dtype}
 
-    # 2. replace observer node with quant - dequant node
+    # 2. insert choose_qparams op and update the qparams list
+
+    # only needed for is_dynamic because the quantization parameters for static
+    # quantization is fixed (based on calibration), we don't need to compute it
+    # dynamically in the graph
+    # with choose_qparams
+    if is_dynamic:
+        # only supported for is_decomposed now, but we should probably align the
+        # non-decomposed path with this as well, and that should probably be done
+        # after we remove reduce_range flag
+        if is_decomposed:
+            with graph.inserting_before(node):
+                input_node = node.args[0]
+                choose_qparams_op_inputs = [node.args[0]]
+                for key, value in qparams.items():
+                    # we have quant_min, quant_max and dtype, all should be stored
+                    # as literals
+                    choose_qparams_op_inputs.append(value)
+                choose_qparams_node = graph.create_node(
+                    "call_function",
+                    torch.ops.quantized_decomposed.choose_qparams.tensor,
+                    tuple(choose_qparams_op_inputs),
+                    {}
+                )
+                # choose_qparms returns (scale, zero_point)
+                scale_node = graph.create_node(
+                    "call_function",
+                    operator.getitem,
+                    (choose_qparams_node, 0),
+                    {}
+                )
+                zero_point_node = graph.create_node(
+                    "call_function",
+                    operator.getitem,
+                    (choose_qparams_node, 1),
+                    {}
+                )
+                quant_min = qparams["_quant_min_"]
+                quant_max = qparams["_quant_max_"]
+                dtype = qparams["_dtype_"]
+                qparams = {
+                    "_scale_": scale_node,
+                    "_zero_point_": zero_point_node,
+                    "_quant_min_": quant_min,
+                    "_quant_max_": quant_max,
+                    "_dtype_": dtype
+                }
+
+    # 3. replace observer node with quant - dequant node
     with graph.inserting_before(node):
         input_node = node.args[0]
         quantize_op_inputs = [input_node]
-        for key, value in qparams.items():
+        for key, value_or_node in qparams.items():
             # TODO: we can add the information of whether a value needs to
             # be registered as an attribute in qparams dict itself
             if key in ['_scale_', '_zero_point_']:
                 # For scale and zero_point values we register them as buffers in the root module.
                 # TODO: maybe need more complex attr name here
-                qparam_node = create_getattr_from_value(model, graph, module_path + prefix + key, value)
+                if is_dynamic:
+                    # in this case we have a node in the graph since it's dynamically
+                    # computed from the input, with choose_qparams op
+                    qparam_node = value_or_node
+                else:
+                    qparam_node = create_getattr_from_value(
+                        model, graph, module_path + prefix + key, value_or_node)
                 quantize_op_inputs.append(qparam_node)
             else:
                 # for qparams that are not scale/zero_point (like axis, dtype) we store them as literals in the graph.
-                quantize_op_inputs.append(value)
+                quantize_op_inputs.append(value_or_node)
 
         quantized_node = graph.create_node(node_type, quantize_op, tuple(quantize_op_inputs), {})
         if is_decomposed:
             # use the same qparams from quantize op
             dq_inputs = [quantized_node] + quantize_op_inputs[1:]
+            if is_dynamic:
+                # need to use the tensor variant of this op, since scale and zero_point
+                # from choose_qparam are Tensors, instead of float/int, this is to
+                # prevent these nodes being traced away by downstream systems
+                dequantize_op = torch.ops.quantized_decomposed.dequantize_per_tensor.tensor
+            else:
+                dequantize_op = torch.ops.quantized_decomposed.dequantize_per_tensor
             dequantized_node = graph.call_function(
-                torch.ops.quantized_decomposed.dequantize_per_tensor,
+                dequantize_op,
                 tuple(dq_inputs),
                 {}
             )
