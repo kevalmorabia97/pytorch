@@ -135,6 +135,7 @@ class TestUnconvertibleOps(common_utils.TestCase):
                 out = x
                 out += x
                 out = torch.nn.functional.relu(out, inplace=True)
+                return out
 
         module = SkipConnectionModule()
         x = torch.randn(4, 4)
